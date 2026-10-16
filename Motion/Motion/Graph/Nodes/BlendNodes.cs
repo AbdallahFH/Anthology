@@ -42,7 +42,6 @@ public sealed class InertializeDefinition : PoseNodeDefinition
         private Inertializer _inertializer = null!;
         private ValueNodeInstance? _trigger;
         private bool _triggerWasSet;
-
         public Instance(InertializeDefinition def) => _def = def;
 
         public override void Bind(GraphBindContext context)
@@ -222,10 +221,10 @@ public sealed class WeightedBlendDefinition : PoseNodeDefinition
         private PoseNodeInstance[] _inputs = null!;
         private BoundFloat[] _weights = null!;
         private float[] _values = null!;
-
+        private readonly SyncTrack _BlendTrack = new();
         public Instance(WeightedBlendDefinition def) => _def = def;
 
-        public override SyncTrack SyncTrack => _inputs.Length > 0 ? _inputs[0].SyncTrack : SyncTrack.Default;
+        public override SyncTrack SyncTrack => _BlendTrack;
 
         public override void Bind(GraphBindContext context)
         {
@@ -247,9 +246,46 @@ public sealed class WeightedBlendDefinition : PoseNodeDefinition
         {
             foreach (PoseNodeInstance input in _inputs)
                 input.Initialize(context, initialTime);
-            CopyTimingFrom(_inputs[0]);
+            BlendTiming(context);
+            PreviousTime = NormalizedTime = initialTime.HasValue ? _BlendTrack.GetPercentageThrough(initialTime.Value) : 0;
         }
-
+        private float BlendTiming(GraphContext context)
+        {
+            float total = 0f;
+            for (int i = 0; i < _inputs.Length; i++)
+            {
+                float weight = _weights[i].Get(context);
+                _values[i] = float.IsFinite(weight)&& weight>0f? weight: 0f;
+                total += _values[i];
+            }
+            int first = 0;
+            if (total > 0f)
+            {
+                while (_values[first]<=0f)
+                {
+                    first++;
+                }
+            }
+            PoseNodeInstance lead = _inputs[first];
+            _BlendTrack.SetToBlend(lead.SyncTrack,lead.SyncTrack,0f);
+            float duration = lead.Duration;
+            float accumulated = total>0f? _values[first]:1f;
+            for (int i = first+ 1; i < _inputs.Length; i++)
+            {
+                if(_values[i] <= 0f)
+                {
+                    continue;
+                }
+                PoseNodeInstance input = _inputs[i];
+                float t = GraphSync.TimingWeight(duration,input.Duration,_values[i]/(accumulated+_values[i]));
+                int blendedCount = _BlendTrack.EventCount;
+                _BlendTrack.SetToBlend(_BlendTrack,input.SyncTrack,t);
+                duration = SyncTrack.CalculateDurationSynchronized(duration,input.Duration,blendedCount,input.SyncTrack.EventCount,_BlendTrack.EventCount,t);
+                accumulated += _values[i];
+            }
+            Duration = duration;
+            return total;
+        }
         protected override void OnShutdown(GraphContext context)
         {
             foreach (PoseNodeInstance input in _inputs)
@@ -258,16 +294,21 @@ public sealed class WeightedBlendDefinition : PoseNodeDefinition
 
         protected override void OnUpdate(GraphContext context)
         {
-            float total = 0f;
+            float total = BlendTiming(context);
+            float previous = NormalizedTime;
+
+            SyncTrackTimeRange range = GraphSync.UpdateRange(context,_BlendTrack,previous,Duration,true,out float current);
+
             for (int i = 0; i < _inputs.Length; i++)
             {
-                _inputs[i].Update(context);
-                float weight = _weights[i].Get(context);
-                _values[i] = float.IsFinite(weight) && weight > 0f ? weight : 0f;
-                total += _values[i];
+                GraphSync.UpdateSynchronized(context,_inputs[i],range);
             }
-
-            CopyTimingFrom(_inputs[0]);
+            float a,b;//just a useless variables to fill the method Resolve :)
+            GraphSync.Resolve(_BlendTrack,range,out a, out b, out bool backward,out int warps);
+            PreviousTime = context.SyncRange.HasValue ? _BlendTrack.GetPercentageThrough(range.Start) : previous;
+            NormalizedTime = current;
+            PlayingBackward = backward;
+            LoopCount += backward? -warps: warps;
 
             // An input fires its events as strongly as it shows, so a clip at weight 0 makes no footsteps.
             for (int i = 0; i < _inputs.Length; i++)
@@ -275,7 +316,8 @@ public sealed class WeightedBlendDefinition : PoseNodeDefinition
 
             if (total <= 0f)
             {
-                CopyResultFrom(_inputs[0]);
+                Pose.CopyFrom(_inputs[0].Pose);
+                RootMotionDelta = _inputs[0].RootMotionDelta;
                 return;
             }
 
